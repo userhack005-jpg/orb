@@ -228,15 +228,18 @@ def _tv_scan_endpoint(endpoint, tickers):
     for item in data:
         sym = item.get("s", "").upper()
         d = item.get("d", [])
-        if len(d) >= 7:
-            live_tick = d[1] if d[1] is not None else d[0]
-            out[sym] = {
-                "live": live_tick,
-                "m5_open": d[3],
-                "m5_high": d[4],
-                "m5_low": d[5],
-                "m5_close": d[6]
-            }
+        if len(d) >= 1:
+            close_val = d[0] if len(d) > 0 else None
+            bid_val = d[1] if len(d) > 1 else None
+            live_tick = bid_val if bid_val is not None else close_val
+            if live_tick is not None:
+                out[sym] = {
+                    "live": live_tick,
+                    "m5_open": d[3] if len(d) > 3 and d[3] is not None else live_tick,
+                    "m5_high": d[4] if len(d) > 4 and d[4] is not None else live_tick,
+                    "m5_low": d[5] if len(d) > 5 and d[5] is not None else live_tick,
+                    "m5_close": d[6] if len(d) > 6 and d[6] is not None else live_tick
+                }
     return out, 200
 
 def fetch_tv_batch(symbols):
@@ -250,8 +253,8 @@ def fetch_tv_batch(symbols):
     out = {}
     remaining = list(unique_syms)
 
-    # 1. Try global, then cfd, forex, crypto for any missing symbols
-    for ep in ("global", "cfd", "forex", "crypto"):
+    # CFD & Metals first for XAUUSD / XAGUSD, then global, forex, crypto
+    for ep in ("cfd", "metals", "global", "forex", "crypto"):
         if not remaining:
             break
         try:
@@ -264,7 +267,6 @@ def fetch_tv_batch(symbols):
         except Exception as e:
             print(f"[TV] {ep}/scan error: {e}", flush=True)
 
-    # 2. Direct /symbol fallback for any ticker still missing (works for metals/CFDs/stocks)
     for sym in remaining:
         try:
             r = requests.get(
@@ -278,13 +280,14 @@ def fetch_tv_batch(symbols):
             )
             if r.status_code == 200 and r.text.strip():
                 j = r.json()
-                if j.get("close") is not None or j.get("bid") is not None:
+                live_tick = j.get("bid") if j.get("bid") is not None else j.get("close")
+                if live_tick is not None:
                     out[sym] = {
-                        "live": j.get("bid") if j.get("bid") is not None else j.get("close"),
-                        "m5_open": j.get("open|5"),
-                        "m5_high": j.get("high|5"),
-                        "m5_low": j.get("low|5"),
-                        "m5_close": j.get("close|5")
+                        "live": live_tick,
+                        "m5_open": j.get("open|5") if j.get("open|5") is not None else live_tick,
+                        "m5_high": j.get("high|5") if j.get("high|5") is not None else live_tick,
+                        "m5_low": j.get("low|5") if j.get("low|5") is not None else live_tick,
+                        "m5_close": j.get("close|5") if j.get("close|5") is not None else live_tick
                     }
         except Exception as e:
             print(f"[TV] /symbol fallback error ({sym}): {e}", flush=True)
@@ -295,8 +298,6 @@ def validate_tv_symbol(symbol):
     sym = symbol.strip().upper().replace(" ", "").replace("/", "")
     res = fetch_tv_batch([sym])
     return sym in res, res.get(sym)
-
-
 # ================= INLINE KEYBOARD BUILDERS =================
 def main_menu_keyboard(user):
     toggle_text = "⏸️ Pause Alerts" if user.get("active", True) else "▶️ Resume Alerts"
