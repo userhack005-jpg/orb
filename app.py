@@ -226,14 +226,16 @@ def run_bot():
 
         current_slot = (now.hour, now.minute // 5)
 
-        # 2. 5-Minute Candle Close Detection (Zero Missed Closes)
+    # 2. 5-Minute Candle Close Detection
         if active_slot is not None and current_slot != active_slot and last_slot_close_price is not None:
             closed_price = last_slot_close_price
+            breakout_triggered = False
 
             if state == "SEEKING_INITIAL_BREAK":
                 if closed_price < range_low:
                     state = "WAIT_SELL_RETEST"
                     breakout_slot = current_slot
+                    breakout_triggered = True
                     send_telegram(
                         f"🔻 [{title}] Close Below Range Low ({closed_price} < {range_low}). Ready for SELL...",
                         alert_type="breakout_close"
@@ -241,6 +243,7 @@ def run_bot():
                 elif closed_price > range_high:
                     state = "WAIT_BUY_RETEST"
                     breakout_slot = current_slot
+                    breakout_triggered = True
                     send_telegram(
                         f"🔺 [{title}] Close Above Range High ({closed_price} > {range_high}). Ready for BUY...",
                         alert_type="breakout_close"
@@ -250,6 +253,7 @@ def run_bot():
                 if closed_price > range_high:
                     state = "WAIT_BUY_RETEST"
                     breakout_slot = current_slot
+                    breakout_triggered = True
                     send_telegram(
                         f"🔄 [{title}] Range High Broken Now! ({closed_price} > {range_high}). Ready for BUY...",
                         alert_type="breakout_close"
@@ -259,17 +263,26 @@ def run_bot():
                 if closed_price < range_low:
                     state = "WAIT_SELL_RETEST"
                     breakout_slot = current_slot
+                    breakout_triggered = True
                     send_telegram(
                         f"🔄 [{title}] Range Low Broken Now! ({closed_price} < {range_low}). Ready for SELL...",
                         alert_type="breakout_close"
                     )
 
+            # ब्रेकआउट होते ही 6 सेकंड रुकें ताकि TradingView नई कैंडल का High/Low रीसेट कर ले
+            if breakout_triggered:
+                active_slot = current_slot
+                last_slot_close_price = data["m5_close"]
+                time.sleep(6)
+                continue
+
         active_slot = current_slot
         last_slot_close_price = data["m5_close"]
 
-        # 3. Live Retest Entry Check (Immediate Tick + Wick Touch)
+        # 3. Live Retest Entry Check (सिर्फ लाइव प्राइस पर, और 10 सेकंड बाद ही नई कैंडल की विक चेक करें)
         if state == "WAIT_SELL_RETEST":
-            if data["live"] >= range_low or (current_slot == breakout_slot and data["m5_high"] >= range_low):
+            wick_touch = (now.second >= 10 and data["m5_high"] >= range_low)
+            if data["live"] >= range_low or wick_touch:
                 retest_count += 1
                 send_telegram(
                     f"✅ [{title}] Successful SELL Entered! ({retest_count}/{max_retests})\n"
@@ -283,7 +296,8 @@ def run_bot():
                     state = "IN_SELL_SEEKING_HIGH_BREAK"
 
         elif state == "WAIT_BUY_RETEST":
-            if data["live"] <= range_high or (current_slot == breakout_slot and data["m5_low"] <= range_high):
+            wick_touch = (now.second >= 10 and data["m5_low"] <= range_high)
+            if data["live"] <= range_high or wick_touch:
                 retest_count += 1
                 send_telegram(
                     f"✅ [{title}] Entered in BUY! ({retest_count}/{max_retests})\n"
