@@ -27,35 +27,48 @@ REDIS_KEY = "orb_multiuser_bot:users_v1"
 
 db_lock = threading.Lock()
 price_cache_lock = threading.Lock()
+users_cache = None
+redis_status = "not_configured"
 latest_prices = {}  # {symbol: {"live": ..., "m5_open": ..., "m5_high": ..., "m5_low": ..., "m5_close": ...}}
 
-# ================= STORAGE (UPSTASH REDIS + LOCAL FALLBACK) =================
+# ================= STORAGE (IN-MEMORY CACHE + UPSTASH REDIS) =================
 def _redis_headers():
     return {
         "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
         "Content-Type": "application/json"
     }
-users_cache = None
+
+def _is_valid_rest_url(url):
+    return url.startswith("https://") and ":6379" not in url
 
 def load_all_users():
-    global users_cache
+    global users_cache, redis_status
     with db_lock:
         if users_cache is not None:
             return users_cache
 
         if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
-            try:
-                resp = requests.get(
-                    f"{UPSTASH_REDIS_REST_URL}/get/{REDIS_KEY}",
-                    headers=_redis_headers(),
-                    timeout=8
-                )
-                if resp.status_code == 200:
-                    result = resp.json().get("result")
-                    users_cache = json.loads(result) if result else {}
-                    return users_cache
-            except Exception as e:
-                print(f"[DB] Redis read error: {e}", flush=True)
+            if not _is_valid_rest_url(UPSTASH_REDIS_REST_URL):
+                redis_status = "error: use https:// REST URL (without :6379)"
+                print(f"[DB] {redis_status}", flush=True)
+            else:
+                try:
+                    resp = requests.get(
+                        f"{UPSTASH_REDIS_REST_URL}/get/{REDIS_KEY}",
+                        headers=_redis_headers(),
+                        timeout=8
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json().get("result")
+                        users_cache = json.loads(result) if result else {}
+                        redis_status = "connected"
+                        return users_cache
+                    else:
+                        redis_status = f"http_{resp.status_code}"
+                        print(f"[DB] Redis HTTP {resp.status_code}: {resp.text[:120]}", flush=True)
+                except Exception as e:
+                    redis_status = f"error: {type(e).__name__}"
+                    print(f"[DB] Redis read error: {e}", flush=True)
 
         if os.path.exists(LOCAL_DB_FILE):
             try:
@@ -69,20 +82,27 @@ def load_all_users():
         return users_cache
 
 def save_all_users(users_dict):
-    global users_cache
+    global users_cache, redis_status
     with db_lock:
         users_cache = users_dict
         raw = json.dumps(users_dict)
-        if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+
+        if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN and _is_valid_rest_url(UPSTASH_REDIS_REST_URL):
             try:
-                requests.post(
+                resp = requests.post(
                     f"{UPSTASH_REDIS_REST_URL}/set/{REDIS_KEY}",
                     headers=_redis_headers(),
                     data=raw.encode("utf-8"),
                     timeout=8
                 )
+                if resp.status_code == 200:
+                    redis_status = "connected"
+                else:
+                    redis_status = f"write_http_{resp.status_code}"
             except Exception as e:
+                redis_status = f"write_error: {type(e).__name__}"
                 print(f"[DB] Redis write error: {e}", flush=True)
+
         try:
             tmp = LOCAL_DB_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -90,6 +110,7 @@ def save_all_users(users_dict):
             os.replace(tmp, LOCAL_DB_FILE)
         except Exception as e:
             print(f"[DB] Local write error: {e}", flush=True)
+
 def default_user_profile(chat_id):
     return {
         "chat_id": str(chat_id),
@@ -105,10 +126,8 @@ def default_user_profile(chat_id):
             {"title": "Asian Open", "time": "01:00"},
             {"title": "London Open", "time": "12:00"}
         ],
-        # Interactive UI flow state
         "ui_step": None,
         "ui_temp": {},
-        # Runtime ORB tracking state
         "runtime": {
             "active_instance_id": None,
             "active_range_title": "-",
@@ -128,7 +147,6 @@ def get_or_create_user(users, chat_id):
     if cid not in users:
         users[cid] = default_user_profile(cid)
     else:
-        # Ensure all keys exist for older records
         base = default_user_profile(cid)
         for k, v in base.items():
             if k not in users[cid]:
@@ -183,7 +201,6 @@ def answer_callback(callback_query_id, text=""):
 def setup_bot_commands_and_webhook():
     if not TELEGRAM_BOT_TOKEN:
         return
-    # Register Menu Tab Commands
     commands = [
         {"command": "start", "description": "Open Main Menu & Welcome"},
         {"command": "ranges", "description": "Add, Edit, or Delete Range Timings"},
@@ -192,7 +209,6 @@ def setup_bot_commands_and_webhook():
     ]
     tg_api("setMyCommands", {"commands": commands})
 
-    # Auto-register Webhook if RENDER_EXTERNAL_URL is set
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         res = tg_api("setWebhook", {"url": webhook_url, "drop_pending_updates": False})
@@ -207,7 +223,6 @@ TV_HEADERS = {
 }
 
 def fetch_tv_batch(symbols):
-    """Fetch multiple unique symbols in ONE single TradingView API call."""
     unique_syms = sorted(list(set(s.strip().upper() for s in symbols if s and s.strip())))
     if not unique_syms:
         return {}
@@ -408,7 +423,6 @@ def send_user_alert(user, msg, alert_type):
     send_message(user["chat_id"], msg)
 
 def process_user_orb(user, data, now):
-    """Runs the ORB state machine for a single user. Returns True if state changed."""
     changed = False
     ranges = user.get("ranges", [])
     rt = user["runtime"]
@@ -424,7 +438,6 @@ def process_user_orb(user, data, now):
 
     instance_id, title, time_str, target_start, target_end = sched
 
-    # Automatic sequential handoff to new range
     if rt.get("active_instance_id") != instance_id:
         rt["active_instance_id"] = instance_id
         rt["active_range_title"] = title
@@ -435,17 +448,11 @@ def process_user_orb(user, data, now):
         rt["active_slot"] = None
         rt["last_slot_close_price"] = None
         rt["retest_cooldown_until"] = 0.0
-        if target_start <= now < target_end:
-            rt["state"] = "MARKING_RANGE"
-        else:
-            rt["state"] = "MISSED_WINDOW_WAITING_NEXT"
+        rt["state"] = "MARKING_RANGE" if (target_start <= now < target_end) else "MISSED_WINDOW_WAITING_NEXT"
         changed = True
 
     state = rt["state"]
-    if state in ("DONE_FOR_RANGE", "MISSED_WINDOW_WAITING_NEXT"):
-        return changed
-
-    if not data:
+    if state in ("DONE_FOR_RANGE", "MISSED_WINDOW_WAITING_NEXT") or not data:
         return changed
 
     # 1. Mark 5-minute range
@@ -479,7 +486,7 @@ def process_user_orb(user, data, now):
     r_high = rt["range_high"]
     r_low = rt["range_low"]
 
-    # 2. 5-Minute Candle Close Detection (Zero Missed Closes)
+    # 2. 5-Minute Candle Close Detection
     if active_slot is not None and current_slot != active_slot and last_close is not None:
         breakout_triggered = False
 
@@ -507,36 +514,33 @@ def process_user_orb(user, data, now):
                     "breakout_close"
                 )
 
-        elif state == "IN_SELL_SEEKING_HIGH_BREAK":
-            if last_close > r_high:
-                rt["state"] = "WAIT_BUY_RETEST"
-                breakout_triggered = True
-                send_user_alert(
-                    user,
-                    f"🔄 <b>[{title}] Range High Broken!</b>\n"
-                    f"Symbol: <code>{symbol}</code>\n"
-                    f"Close: <code>{last_close}</code> &gt; High: <code>{r_high}</code>\n"
-                    f"Status: Reversal — Waiting for BUY Retest...",
-                    "breakout_close"
-                )
+        elif state == "IN_SELL_SEEKING_HIGH_BREAK" and last_close > r_high:
+            rt["state"] = "WAIT_BUY_RETEST"
+            breakout_triggered = True
+            send_user_alert(
+                user,
+                f"🔄 <b>[{title}] Range High Broken!</b>\n"
+                f"Symbol: <code>{symbol}</code>\n"
+                f"Close: <code>{last_close}</code> &gt; High: <code>{r_high}</code>\n"
+                f"Status: Reversal — Waiting for BUY Retest...",
+                "breakout_close"
+            )
 
-        elif state == "IN_BUY_SEEKING_LOW_BREAK":
-            if last_close < r_low:
-                rt["state"] = "WAIT_SELL_RETEST"
-                breakout_triggered = True
-                send_user_alert(
-                    user,
-                    f"🔄 <b>[{title}] Range Low Broken!</b>\n"
-                    f"Symbol: <code>{symbol}</code>\n"
-                    f"Close: <code>{last_close}</code> &lt; Low: <code>{r_low}</code>\n"
-                    f"Status: Reversal — Waiting for SELL Retest...",
-                    "breakout_close"
-                )
+        elif state == "IN_BUY_SEEKING_LOW_BREAK" and last_close < r_low:
+            rt["state"] = "WAIT_SELL_RETEST"
+            breakout_triggered = True
+            send_user_alert(
+                user,
+                f"🔄 <b>[{title}] Range Low Broken!</b>\n"
+                f"Symbol: <code>{symbol}</code>\n"
+                f"Close: <code>{last_close}</code> &lt; Low: <code>{r_low}</code>\n"
+                f"Status: Reversal — Waiting for SELL Retest...",
+                "breakout_close"
+            )
 
         rt["active_slot"] = current_slot
         rt["last_slot_close_price"] = data["m5_close"]
         if breakout_triggered:
-            # Non-blocking 8-second cooldown so stale previous-candle wick never triggers false retest
             rt["retest_cooldown_until"] = time.time() + 8.0
         return True
 
@@ -545,7 +549,7 @@ def process_user_orb(user, data, now):
         rt["last_slot_close_price"] = data["m5_close"]
         changed = True
 
-    # 3. Immediate Live Retest Entry Check (after cooldown)
+    # 3. Immediate Live Retest Entry Check
     if time.time() < rt.get("retest_cooldown_until", 0.0):
         return changed
 
@@ -583,7 +587,6 @@ def process_user_orb(user, data, now):
     return changed
 
 def monitor_loop():
-    # Ensure only ONE background monitor runs across Gunicorn workers
     if fcntl:
         try:
             lock_fp = open(LOCK_FILE, "w")
@@ -592,6 +595,7 @@ def monitor_loop():
             return
 
     print("🚀 Multi-User ORB Monitoring Engine Started.", flush=True)
+    load_all_users()  # Warm RAM cache once from Upstash Redis
     setup_bot_commands_and_webhook()
 
     while True:
@@ -638,7 +642,6 @@ def handle_message(msg):
     users = load_all_users()
     user = get_or_create_user(users, chat_id)
 
-    # Slash commands reset any in-progress input step
     if text.startswith("/"):
         user["ui_step"] = None
         user["ui_temp"] = {}
@@ -660,7 +663,6 @@ def handle_message(msg):
             send_message(chat_id, "Unknown command. Use /start to open the Main Menu.")
         return
 
-    # Handle interactive text steps
     step = user.get("ui_step")
     if step == "AWAIT_SYMBOL":
         sym = text.upper()
@@ -679,7 +681,7 @@ def handle_message(msg):
             return
         user["symbol"] = sym
         user["ui_step"] = None
-        user["runtime"]["active_instance_id"] = None  # Reset runtime for new symbol
+        user["runtime"]["active_instance_id"] = None
         save_all_users(users)
         send_message(
             chat_id,
@@ -751,7 +753,6 @@ def handle_message(msg):
         send_message(chat_id, "✅ Range updated!\n\n" + t, kb)
         return
 
-    # Default fallback if user types random text
     send_message(chat_id, main_menu_text(user), main_menu_keyboard(user))
 
 def handle_callback(cb):
@@ -879,25 +880,19 @@ def handle_callback(cb):
 # ================= FLASK ROUTES =================
 @app.route("/")
 def home():
-    users = {}
-    if os.path.exists(LOCAL_DB_FILE):
-        try:
-            with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
-                users = json.load(f)
-        except Exception:
-            users = {}
+    users = load_all_users()
     active_cnt = sum(1 for u in users.values() if u.get("active", True))
     unique_syms = len(set(u["symbol"].upper() for u in users.values() if u.get("active", True)))
-    redis_ok = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
     return jsonify({
         "service": "ORB Multi-User Telegram Bot",
         "status": "running",
-        "storage": "Upstash Redis" if redis_ok else "Local JSON",
+        "redis_status": redis_status,
         "total_users": len(users),
         "active_users": active_cnt,
         "tracked_unique_symbols": unique_syms,
         "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     })
+
 @app.route("/health")
 def health():
     return "OK", 200
