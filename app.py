@@ -35,9 +35,14 @@ def _redis_headers():
         "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
         "Content-Type": "application/json"
     }
+users_cache = None
 
 def load_all_users():
+    global users_cache
     with db_lock:
+        if users_cache is not None:
+            return users_cache
+
         if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
             try:
                 resp = requests.get(
@@ -47,22 +52,26 @@ def load_all_users():
                 )
                 if resp.status_code == 200:
                     result = resp.json().get("result")
-                    if result:
-                        return json.loads(result)
-                    return {}
+                    users_cache = json.loads(result) if result else {}
+                    return users_cache
             except Exception as e:
                 print(f"[DB] Redis read error: {e}", flush=True)
-        # Fallback to local JSON file
+
         if os.path.exists(LOCAL_DB_FILE):
             try:
                 with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    users_cache = json.load(f)
+                    return users_cache
             except Exception:
-                return {}
-        return {}
+                pass
+
+        users_cache = {}
+        return users_cache
 
 def save_all_users(users_dict):
+    global users_cache
     with db_lock:
+        users_cache = users_dict
         raw = json.dumps(users_dict)
         if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
             try:
@@ -74,7 +83,6 @@ def save_all_users(users_dict):
                 )
             except Exception as e:
                 print(f"[DB] Redis write error: {e}", flush=True)
-        # Also mirror locally for fast reads / fallback
         try:
             tmp = LOCAL_DB_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -82,7 +90,6 @@ def save_all_users(users_dict):
             os.replace(tmp, LOCAL_DB_FILE)
         except Exception as e:
             print(f"[DB] Local write error: {e}", flush=True)
-
 def default_user_profile(chat_id):
     return {
         "chat_id": str(chat_id),
