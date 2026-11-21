@@ -872,20 +872,25 @@ def handle_callback(cb):
 # ================= FLASK ROUTES =================
 @app.route("/")
 def home():
-    users = load_all_users()
+    users = {}
+    if os.path.exists(LOCAL_DB_FILE):
+        try:
+            with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+        except Exception:
+            users = {}
     active_cnt = sum(1 for u in users.values() if u.get("active", True))
     unique_syms = len(set(u["symbol"].upper() for u in users.values() if u.get("active", True)))
     redis_ok = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
     return jsonify({
         "service": "ORB Multi-User Telegram Bot",
         "status": "running",
-        "storage": "Upstash Redis" if redis_ok else "Local JSON (Set Upstash env vars for persistence)",
+        "storage": "Upstash Redis" if redis_ok else "Local JSON",
         "total_users": len(users),
         "active_users": active_cnt,
         "tracked_unique_symbols": unique_syms,
         "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     })
-
 @app.route("/health")
 def health():
     return "OK", 200
