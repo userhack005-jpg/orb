@@ -3,27 +3,56 @@ import json
 import time
 import threading
 import requests
-import pytz
-from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime, timedelta, timezone
-IST = timezone(timedelta(hours=5, minutes=30))
+from flask import Flask, request, jsonify, render_template_string
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 app = Flask(__name__)
 
+IST = timezone(timedelta(hours=5, minutes=30))
 CONFIG_FILE = "config.json"
+STATUS_FILE = "status.json"
+LOCK_FILE = "/tmp/orb_bot.lock"
 config_lock = threading.Lock()
 
-# Shared bot runtime state (for Dashboard live view)
-bot_status = {
+default_status = {
     "live_price": None,
+    "m5_high": None,
+    "m5_low": None,
     "active_range_title": "Waiting...",
     "active_range_time": "-",
     "state": "INITIALIZING",
     "range_high": None,
     "range_low": None,
     "retest_count": 0,
+    "max_retests": 4,
     "last_updated": "-",
     "logs": []
 }
+
+bot_status = dict(default_status)
+
+def save_status():
+    try:
+        tmp_file = STATUS_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(bot_status, f)
+        os.replace(tmp_file, STATUS_FILE)
+    except Exception:
+        pass
+
+def read_status():
+    try:
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return bot_status
 
 def add_log(msg):
     ts = datetime.now(IST).strftime("%H:%M:%S")
@@ -31,7 +60,7 @@ def add_log(msg):
     print(entry, flush=True)
     bot_status["logs"].insert(0, entry)
     bot_status["logs"] = bot_status["logs"][:30]
-
+    save_status()
 
 def load_config():
     with config_lock:
@@ -40,15 +69,14 @@ def load_config():
                 cfg = json.load(f)
         else:
             cfg = {
-                "symbol": "OANDA:XAUUSD",
+                "symbol": "BINANCE:BTCUSDT",
                 "timezone": "Asia/Kolkata",
                 "telegram_bot_token": "",
                 "telegram_chat_id": "",
                 "max_retests": 4,
                 "alerts": {"range_marked": True, "breakout_close": True, "retest_entry": True},
-                "ranges": [{"title": "Default Range", "time": "01:35"}]
+                "ranges": [{"title": "Asian Open", "time": "01:00"}]
             }
-        # Allow Render Environment Variables to override empty/placeholder tokens
         env_token = os.environ.get("TELEGRAM_BOT_TOKEN")
         env_chat = os.environ.get("TELEGRAM_CHAT_ID")
         if env_token and (not cfg.get("telegram_bot_token") or cfg["telegram_bot_token"] == "YOUR_TELEGRAM_BOT_TOKEN"):
@@ -59,7 +87,6 @@ def load_config():
 
 def save_config(new_cfg):
     with config_lock:
-        # Sort ranges chronologically by HH:MM
         valid_ranges = []
         for r in new_cfg.get("ranges", []):
             t = r.get("time", "").strip()
@@ -96,6 +123,9 @@ def get_tv_data(symbol):
     }
     try:
         res = requests.post(url, json=payload, timeout=5).json()
+        if not res.get("data"):
+            add_log(f"⚠️ Symbol not found on TradingView: {symbol}")
+            return None
         d = res["data"][0]["d"]
         live_tick = d[1] if d[1] is not None else d[0]
         return {
@@ -110,13 +140,8 @@ def get_tv_data(symbol):
         return None
 
 def get_current_schedule(now, ranges):
-    """
-    Returns (instance_id, title, start_dt, end_dt) for the currently active range.
-    Handles multiple sequential ranges AND 24-hour wrap-around for single/last range.
-    """
     if not ranges:
         return None
-
     sorted_ranges = sorted(ranges, key=lambda x: x["time"])
     candidates = []
     for day_offset in (-1, 0):
@@ -126,17 +151,22 @@ def get_current_schedule(now, ranges):
             start_dt = datetime(base_date.year, base_date.month, base_date.day, hh, mm, 0, tzinfo=IST)
             if start_dt <= now:
                 candidates.append((start_dt, r["title"], r["time"]))
-
     if not candidates:
         return None
-
-    # The latest range whose start time has arrived is the active one
     start_dt, title, time_str = candidates[-1]
     end_dt = start_dt + timedelta(minutes=5)
     instance_id = f"{start_dt.strftime('%Y-%m-%d')}_{time_str}"
     return instance_id, title, time_str, start_dt, end_dt
 
 def run_bot():
+    # Ensure only ONE bot loop runs even if Gunicorn spawns multiple workers
+    if fcntl:
+        try:
+            lock_fp = open(LOCK_FILE, "w")
+            fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            return
+
     active_instance_id = None
     state = "WAITING_FOR_RANGE"
     range_high = None
@@ -152,19 +182,29 @@ def run_bot():
     while True:
         cfg = load_config()
         now = datetime.now(IST)
-        symbol = cfg.get("symbol", "OANDA:XAUUSD")
+        symbol = cfg.get("symbol", "BINANCE:BTCUSDT")
         max_retests = int(cfg.get("max_retests", 4))
         ranges = cfg.get("ranges", [])
+
+        bot_status["max_retests"] = max_retests
+        bot_status["last_updated"] = now.strftime("%H:%M:%S IST")
+
+        # Always fetch live price & 5m high/low so Dashboard stays live 24/7
+        data = get_tv_data(symbol)
+        if data:
+            bot_status["live_price"] = data["live"]
+            bot_status["m5_high"] = data["m5_high"]
+            bot_status["m5_low"] = data["m5_low"]
 
         sched = get_current_schedule(now, ranges)
         if not sched:
             bot_status["state"] = "NO_RANGES_CONFIGURED"
+            save_status()
             time.sleep(5)
             continue
 
         instance_id, title, time_str, target_start, target_end = sched
 
-        # Switch to new range automatically when next scheduled time arrives
         if active_instance_id != instance_id:
             active_instance_id = instance_id
             range_high = None
@@ -178,9 +218,8 @@ def run_bot():
                 state = "MARKING_RANGE"
                 add_log(f"⏱️ New Range Active: [{title} - {time_str}]. Marking 5m High/Low...")
             else:
-                # Bot started after this range's 5m window already passed
                 state = "MISSED_WINDOW_WAITING_NEXT"
-                add_log(f"⏭️ [{title} - {time_str}] window already passed. Waiting for next scheduled range.")
+                add_log(f"⏭️ [{title} - {time_str}] window passed. Waiting for next scheduled range.")
 
         bot_status["active_range_title"] = title
         bot_status["active_range_time"] = time_str
@@ -188,20 +227,16 @@ def run_bot():
         bot_status["range_high"] = range_high
         bot_status["range_low"] = range_low
         bot_status["retest_count"] = retest_count
-        bot_status["last_updated"] = now.strftime("%H:%M:%S IST")
-
-        data = get_tv_data(symbol)
-        if data:
-            bot_status["live_price"] = data["live"]
+        save_status()
 
         if state in ("DONE_FOR_RANGE", "MISSED_WINDOW_WAITING_NEXT"):
-            time.sleep(4)
+            time.sleep(3)
             continue
 
         if not data:
             time.sleep(3)
             continue
-            
+
         # 1. Marking the 5-minute range
         if state == "MARKING_RANGE":
             if now < target_end:
@@ -209,12 +244,15 @@ def run_bot():
                 range_low = data["m5_low"]
                 bot_status["range_high"] = range_high
                 bot_status["range_low"] = range_low
+                save_status()
                 time.sleep(2)
                 continue
             else:
                 if range_high is not None and range_low is not None:
                     state = "SEEKING_INITIAL_BREAK"
                     active_slot = (now.hour, now.minute // 5)
+                    bot_status["state"] = state
+                    save_status()
                     send_telegram(
                         f"📌 [{title} | {time_str}] Range Marked ({symbol})\n"
                         f"High: {range_high}\nLow: {range_low}",
@@ -226,7 +264,7 @@ def run_bot():
 
         current_slot = (now.hour, now.minute // 5)
 
-    # 2. 5-Minute Candle Close Detection
+        # 2. 5-Minute Candle Close Detection
         if active_slot is not None and current_slot != active_slot and last_slot_close_price is not None:
             closed_price = last_slot_close_price
             breakout_triggered = False
@@ -269,19 +307,20 @@ def run_bot():
                         alert_type="breakout_close"
                     )
 
-            # ब्रेकआउट होते ही 6 सेकंड रुकें ताकि TradingView नई कैंडल का High/Low रीसेट कर ले
             if breakout_triggered:
                 active_slot = current_slot
                 last_slot_close_price = data["m5_close"]
+                bot_status["state"] = state
+                save_status()
                 time.sleep(6)
                 continue
 
         active_slot = current_slot
         last_slot_close_price = data["m5_close"]
 
-        # 3. Live Retest Entry Check (सिर्फ लाइव प्राइस पर, और 10 सेकंड बाद ही नई कैंडल की विक चेक करें)
+        # 3. Live Retest Entry Check (Immediate Tick + Wick after 10s)
         if state == "WAIT_SELL_RETEST":
-            wick_touch = (now.second >= 10 and data["m5_high"] >= range_low)
+            wick_touch = (now.second >= 10 and data["m5_high"] is not None and data["m5_high"] >= range_low)
             if data["live"] >= range_low or wick_touch:
                 retest_count += 1
                 send_telegram(
@@ -296,7 +335,7 @@ def run_bot():
                     state = "IN_SELL_SEEKING_HIGH_BREAK"
 
         elif state == "WAIT_BUY_RETEST":
-            wick_touch = (now.second >= 10 and data["m5_low"] <= range_high)
+            wick_touch = (now.second >= 10 and data["m5_low"] is not None and data["m5_low"] <= range_high)
             if data["live"] <= range_high or wick_touch:
                 retest_count += 1
                 send_telegram(
@@ -310,6 +349,9 @@ def run_bot():
                 else:
                     state = "IN_BUY_SEEKING_LOW_BREAK"
 
+        bot_status["state"] = state
+        bot_status["retest_count"] = retest_count
+        save_status()
         time.sleep(2.5)
 
 # ================= WEB DASHBOARD =================
@@ -322,13 +364,13 @@ DASHBOARD_HTML = """
 <title>ORB Multi-Range Bot Dashboard</title>
 <style>
   body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 16px; }
-  .container { max-width: 720px; margin: auto; }
+  .container { max-width: 740px; margin: auto; }
   .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
   h2, h3 { margin-top: 0; color: #38bdf8; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
   .stat { background: #0f172a; padding: 10px; border-radius: 8px; border: 1px solid #334155; }
   .stat small { color: #94a3b8; display: block; font-size: 12px; }
-  .stat strong { font-size: 16px; color: #f8fafc; }
+  .stat strong { font-size: 15px; color: #f8fafc; word-break: break-word; }
   label { display: block; margin-top: 10px; font-size: 13px; color: #cbd5e1; }
   input[type="text"], input[type="number"], input[type="time"] {
     width: 100%; box-sizing: border-box; padding: 8px 10px; margin-top: 4px;
@@ -342,7 +384,7 @@ DASHBOARD_HTML = """
   button:hover { background: #0369a1; }
   .btn-danger { background: #dc2626; padding: 8px 10px; margin-top: 0; }
   .btn-secondary { background: #475569; }
-  .logs { background: #020617; font-family: monospace; font-size: 12px; padding: 10px; border-radius: 8px; max-height: 200px; overflow-y: auto; line-height: 1.5; }
+  .logs { background: #020617; font-family: monospace; font-size: 12px; padding: 10px; border-radius: 8px; max-height: 220px; overflow-y: auto; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -354,8 +396,9 @@ DASHBOARD_HTML = """
     <div class="grid">
       <div class="stat"><small>Active Range</small><strong id="st_range">-</strong></div>
       <div class="stat"><small>State</small><strong id="st_state">-</strong></div>
-      <div class="stat"><small>Live Price</small><strong id="st_live">-</strong></div>
-      <div class="stat"><small>Range High / Low</small><strong id="st_hl">-</strong></div>
+      <div class="stat"><small>Live Price</small><strong id="st_live" style="color:#4ade80;">-</strong></div>
+      <div class="stat"><small>Range High / Low</small><strong id="st_hl" style="color:#fbbf24;">-</strong></div>
+      <div class="stat"><small>Current 5m High / Low</small><strong id="st_m5hl">-</strong></div>
       <div class="stat"><small>Retests</small><strong id="st_retests">-</strong></div>
     </div>
   </div>
@@ -363,7 +406,7 @@ DASHBOARD_HTML = """
   <div class="card">
     <h3>Settings & Alert Toggles</h3>
     <div class="grid">
-      <div><label>Symbol (TradingView)</label><input type="text" id="symbol"></div>
+      <div><label>Symbol (e.g. OANDA:XAUUSD, BINANCE:BTCUSDT)</label><input type="text" id="symbol"></div>
       <div><label>Max Retests / Range</label><input type="number" id="max_retests" min="1" max="20"></div>
     </div>
     <label>Telegram Bot Token</label><input type="text" id="token">
@@ -406,7 +449,7 @@ function addRangeRow(title, timeVal) {
 async function loadAll() {
   const res = await fetch('/api/config');
   const cfg = await res.json();
-  document.getElementById('symbol').value = cfg.symbol || 'OANDA:XAUUSD';
+  document.getElementById('symbol').value = cfg.symbol || 'BINANCE:BTCUSDT';
   document.getElementById('max_retests').value = cfg.max_retests || 4;
   document.getElementById('token').value = cfg.telegram_bot_token || '';
   document.getElementById('chat_id').value = cfg.telegram_chat_id || '';
@@ -457,12 +500,13 @@ async function testTelegram() {
 async function refreshStatus() {
   const res = await fetch('/api/status');
   const s = await res.json();
-  document.getElementById('updated').innerText = s.last_updated;
+  document.getElementById('updated').innerText = s.last_updated || '-';
   document.getElementById('st_range').innerText = `${s.active_range_title} (${s.active_range_time})`;
-  document.getElementById('st_state').innerText = s.state;
+  document.getElementById('st_state').innerText = s.state || '-';
   document.getElementById('st_live').innerText = s.live_price ?? '-';
   document.getElementById('st_hl').innerText = (s.range_high && s.range_low) ? `${s.range_high} / ${s.range_low}` : '-';
-  document.getElementById('st_retests').innerText = s.retest_count;
+  document.getElementById('st_m5hl').innerText = (s.m5_high && s.m5_low) ? `${s.m5_high} / ${s.m5_low}` : '-';
+  document.getElementById('st_retests').innerText = `${s.retest_count ?? 0} / ${s.max_retests ?? 4}`;
   document.getElementById('logs').innerHTML = (s.logs || []).map(l => `<div>${l}</div>`).join('');
 }
 
@@ -484,7 +528,7 @@ def health():
 
 @app.route("/api/status")
 def api_status():
-    return jsonify(bot_status)
+    return jsonify(read_status())
 
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
@@ -498,7 +542,6 @@ def api_test_telegram():
     send_telegram("🔔 Test Alert from ORB Multi-Range Dashboard!")
     return jsonify({"ok": True})
 
-# Start background bot thread (works under both `python app.py` and `gunicorn`)
 bot_thread = threading.Thread(target=run_bot, daemon=True)
 bot_thread.start()
 
