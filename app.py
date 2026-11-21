@@ -1,16 +1,13 @@
 import os
 import re
+import copy
 import json
 import time
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 
 app = Flask(__name__)
 
@@ -22,94 +19,90 @@ UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip(
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 
 LOCAL_DB_FILE = "users_db.json"
-LOCK_FILE = "/tmp/orb_multiuser_bot.lock"
-REDIS_KEY = "orb_multiuser_bot:users_v1"
+REDIS_KEY = "orb_multiuser_bot:users_v2"
 
-db_lock = threading.Lock()
-price_cache_lock = threading.Lock()
-users_cache = None
+state_lock = threading.Lock()
+webhook_executor = ThreadPoolExecutor(max_workers=4)
+
+users_db = {}
+db_loaded = False
 redis_status = "not_configured"
-latest_prices = {}  # {symbol: {"live": ..., "m5_open": ..., "m5_high": ..., "m5_low": ..., "m5_close": ...}}
+last_tv_poll = "not_yet"
+monitor_started = False
+latest_prices = {}
 
-# ================= STORAGE (IN-MEMORY CACHE + UPSTASH REDIS) =================
-def _redis_headers():
-    return {
-        "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
+# ================= UPSTASH REDIS STORAGE (ZERO LOCK DURING NETWORK I/O) =================
 def _is_valid_rest_url(url):
     return url.startswith("https://") and ":6379" not in url
 
-def load_all_users():
-    global users_cache, redis_status
-    with db_lock:
-        if users_cache is not None:
-            return users_cache
+def _redis_command(cmd_list):
+    global redis_status
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        redis_status = "not_configured (using local JSON)"
+        return None
+    if not _is_valid_rest_url(UPSTASH_REDIS_REST_URL):
+        redis_status = "error: use https:// REST URL (not :6379)"
+        return None
+    try:
+        resp = requests.post(
+            UPSTASH_REDIS_REST_URL,
+            headers={
+                "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json=cmd_list,
+            timeout=6
+        )
+        if resp.status_code == 200:
+            redis_status = "connected"
+            return resp.json().get("result")
+        redis_status = f"http_{resp.status_code}"
+        print(f"[DB] Upstash HTTP {resp.status_code}: {resp.text[:120]}", flush=True)
+    except Exception as e:
+        redis_status = f"error: {type(e).__name__}"
+        print(f"[DB] Upstash error: {e}", flush=True)
+    return None
 
-        if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
-            if not _is_valid_rest_url(UPSTASH_REDIS_REST_URL):
-                redis_status = "error: use https:// REST URL (without :6379)"
-                print(f"[DB] {redis_status}", flush=True)
-            else:
-                try:
-                    resp = requests.get(
-                        f"{UPSTASH_REDIS_REST_URL}/get/{REDIS_KEY}",
-                        headers=_redis_headers(),
-                        timeout=8
-                    )
-                    if resp.status_code == 200:
-                        result = resp.json().get("result")
-                        users_cache = json.loads(result) if result else {}
-                        redis_status = "connected"
-                        return users_cache
-                    else:
-                        redis_status = f"http_{resp.status_code}"
-                        print(f"[DB] Redis HTTP {resp.status_code}: {resp.text[:120]}", flush=True)
-                except Exception as e:
-                    redis_status = f"error: {type(e).__name__}"
-                    print(f"[DB] Redis read error: {e}", flush=True)
+def init_storage():
+    global users_db, db_loaded
+    loaded = None
 
-        if os.path.exists(LOCAL_DB_FILE):
-            try:
-                with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
-                    users_cache = json.load(f)
-                    return users_cache
-            except Exception:
-                pass
+    raw = _redis_command(["GET", REDIS_KEY])
+    if isinstance(raw, str) and raw.strip():
+        try:
+            loaded = json.loads(raw)
+        except Exception as e:
+            print(f"[DB] Redis JSON parse error: {e}", flush=True)
 
-        users_cache = {}
-        return users_cache
+    if loaded is None and os.path.exists(LOCAL_DB_FILE):
+        try:
+            with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except Exception:
+            loaded = {}
 
-def save_all_users(users_dict):
-    global users_cache, redis_status
-    with db_lock:
-        users_cache = users_dict
-        raw = json.dumps(users_dict)
+    with state_lock:
+        if isinstance(loaded, dict):
+            users_db = loaded
+        db_loaded = True
+    print(f"[DB] Loaded {len(users_db)} users. Storage: {redis_status}", flush=True)
 
-        if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN and _is_valid_rest_url(UPSTASH_REDIS_REST_URL):
-            try:
-                resp = requests.post(
-                    f"{UPSTASH_REDIS_REST_URL}/set/{REDIS_KEY}",
-                    headers=_redis_headers(),
-                    data=raw.encode("utf-8"),
-                    timeout=8
-                )
-                if resp.status_code == 200:
-                    redis_status = "connected"
-                else:
-                    redis_status = f"write_http_{resp.status_code}"
-            except Exception as e:
-                redis_status = f"write_error: {type(e).__name__}"
-                print(f"[DB] Redis write error: {e}", flush=True)
+def persist_users_async():
+    """Takes a fast RAM snapshot and saves to Upstash/local without blocking any request."""
+    with state_lock:
+        snapshot = json.dumps(users_db)
 
+    def _writer(raw_str):
         try:
             tmp = LOCAL_DB_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                f.write(raw)
+                f.write(raw_str)
             os.replace(tmp, LOCAL_DB_FILE)
         except Exception as e:
             print(f"[DB] Local write error: {e}", flush=True)
+        _redis_command(["SET", REDIS_KEY, raw_str])
+
+    threading.Thread(target=_writer, args=(snapshot,), daemon=True).start()
 
 def default_user_profile(chat_id):
     return {
@@ -142,19 +135,19 @@ def default_user_profile(chat_id):
         }
     }
 
-def get_or_create_user(users, chat_id):
+def _ensure_user_locked(chat_id):
     cid = str(chat_id)
-    if cid not in users:
-        users[cid] = default_user_profile(cid)
+    if cid not in users_db:
+        users_db[cid] = default_user_profile(cid)
     else:
         base = default_user_profile(cid)
         for k, v in base.items():
-            if k not in users[cid]:
-                users[cid][k] = v
+            if k not in users_db[cid]:
+                users_db[cid][k] = v
         for rk, rv in base["runtime"].items():
-            if rk not in users[cid]["runtime"]:
-                users[cid]["runtime"][rk] = rv
-    return users[cid]
+            if rk not in users_db[cid]["runtime"]:
+                users_db[cid]["runtime"][rk] = rv
+    return users_db[cid]
 
 # ================= TELEGRAM API HELPERS =================
 def tg_api(method, payload):
@@ -163,7 +156,7 @@ def tg_api(method, payload):
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=8)
         return resp.json()
     except Exception as e:
         print(f"[TG] {method} error: {e}", flush=True)
@@ -208,7 +201,6 @@ def setup_bot_commands_and_webhook():
         {"command": "help", "description": "How to use this ORB Trading Bot"}
     ]
     tg_api("setMyCommands", {"commands": commands})
-
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         res = tg_api("setWebhook", {"url": webhook_url, "drop_pending_updates": False})
@@ -232,7 +224,7 @@ def fetch_tv_batch(symbols):
         "columns": ["close", "bid", "ask", "open|5", "high|5", "low|5", "close|5"]
     }
     try:
-        resp = requests.post(url, json=payload, headers=TV_HEADERS, timeout=10)
+        resp = requests.post(url, json=payload, headers=TV_HEADERS, timeout=8)
         if resp.status_code != 200 or not resp.text.strip():
             print(f"[TV] HTTP {resp.status_code} (rate limit/empty)", flush=True)
             return {}
@@ -289,7 +281,6 @@ def main_menu_text(user):
 
 def ranges_menu_view(user):
     ranges = sorted(user.get("ranges", []), key=lambda x: x["time"])
-    user["ranges"] = ranges
     lines = ["⏰ <b>Manage Sequential Ranges (IST 24-Hr)</b>\n"]
     if not ranges:
         lines.append("<i>No ranges configured yet. Tap below to add your first range.</i>")
@@ -340,8 +331,8 @@ def alerts_menu_view(user):
 
 def status_view(user):
     sym = user["symbol"].upper()
-    with price_cache_lock:
-        pdata = latest_prices.get(sym)
+    with state_lock:
+        pdata = copy.deepcopy(latest_prices.get(sym))
     if not pdata:
         fetched = fetch_tv_batch([sym])
         pdata = fetched.get(sym)
@@ -417,24 +408,24 @@ def get_current_schedule(now, ranges):
     instance_id = f"{start_dt.strftime('%Y-%m-%d')}_{time_str}"
     return instance_id, title, time_str, start_dt, end_dt
 
-def send_user_alert(user, msg, alert_type):
-    if not user.get("alerts", {}).get(alert_type, True):
-        return
-    send_message(user["chat_id"], msg)
-
-def process_user_orb(user, data, now):
-    changed = False
+def process_user_orb_locked(user, data, now):
+    persist = False
+    alerts_out = []
     ranges = user.get("ranges", [])
     rt = user["runtime"]
     max_retests = int(user.get("max_retests", 4))
     symbol = user["symbol"].upper()
 
+    def queue_alert(msg, alert_type):
+        if user.get("alerts", {}).get(alert_type, True):
+            alerts_out.append((user["chat_id"], msg))
+
     sched = get_current_schedule(now, ranges)
     if not sched:
         if rt.get("state") != "NO_RANGES":
             rt["state"] = "NO_RANGES"
-            return True
-        return False
+            persist = True
+        return persist, alerts_out
 
     instance_id, title, time_str, target_start, target_end = sched
 
@@ -449,27 +440,24 @@ def process_user_orb(user, data, now):
         rt["last_slot_close_price"] = None
         rt["retest_cooldown_until"] = 0.0
         rt["state"] = "MARKING_RANGE" if (target_start <= now < target_end) else "MISSED_WINDOW_WAITING_NEXT"
-        changed = True
+        persist = True
 
     state = rt["state"]
     if state in ("DONE_FOR_RANGE", "MISSED_WINDOW_WAITING_NEXT") or not data:
-        return changed
+        return persist, alerts_out
 
     # 1. Mark 5-minute range
     if state == "MARKING_RANGE":
         if now < target_end:
-            if rt["range_high"] != data["m5_high"] or rt["range_low"] != data["m5_low"]:
-                rt["range_high"] = data["m5_high"]
-                rt["range_low"] = data["m5_low"]
-                changed = True
-            return changed
+            rt["range_high"] = data["m5_high"]
+            rt["range_low"] = data["m5_low"]
+            return persist, alerts_out
         else:
             if rt["range_high"] is not None and rt["range_low"] is not None:
                 rt["state"] = "SEEKING_INITIAL_BREAK"
                 rt["active_slot"] = [now.hour, now.minute // 5]
                 rt["last_slot_close_price"] = data["m5_close"]
-                send_user_alert(
-                    user,
+                queue_alert(
                     f"📌 <b>[{title} | {time_str} IST] Range Marked</b>\n"
                     f"Symbol: <code>{symbol}</code>\n"
                     f"High: <code>{rt['range_high']}</code>\n"
@@ -478,7 +466,7 @@ def process_user_orb(user, data, now):
                 )
             else:
                 rt["state"] = "MISSED_WINDOW_WAITING_NEXT"
-            return True
+            return True, alerts_out
 
     current_slot = [now.hour, now.minute // 5]
     active_slot = rt.get("active_slot")
@@ -494,8 +482,7 @@ def process_user_orb(user, data, now):
             if last_close < r_low:
                 rt["state"] = "WAIT_SELL_RETEST"
                 breakout_triggered = True
-                send_user_alert(
-                    user,
+                queue_alert(
                     f"🔻 <b>[{title}] Close Below Range Low</b>\n"
                     f"Symbol: <code>{symbol}</code>\n"
                     f"Close: <code>{last_close}</code> &lt; Low: <code>{r_low}</code>\n"
@@ -505,8 +492,7 @@ def process_user_orb(user, data, now):
             elif last_close > r_high:
                 rt["state"] = "WAIT_BUY_RETEST"
                 breakout_triggered = True
-                send_user_alert(
-                    user,
+                queue_alert(
                     f"🔺 <b>[{title}] Close Above Range High</b>\n"
                     f"Symbol: <code>{symbol}</code>\n"
                     f"Close: <code>{last_close}</code> &gt; High: <code>{r_high}</code>\n"
@@ -517,8 +503,7 @@ def process_user_orb(user, data, now):
         elif state == "IN_SELL_SEEKING_HIGH_BREAK" and last_close > r_high:
             rt["state"] = "WAIT_BUY_RETEST"
             breakout_triggered = True
-            send_user_alert(
-                user,
+            queue_alert(
                 f"🔄 <b>[{title}] Range High Broken!</b>\n"
                 f"Symbol: <code>{symbol}</code>\n"
                 f"Close: <code>{last_close}</code> &gt; High: <code>{r_high}</code>\n"
@@ -529,8 +514,7 @@ def process_user_orb(user, data, now):
         elif state == "IN_BUY_SEEKING_LOW_BREAK" and last_close < r_low:
             rt["state"] = "WAIT_SELL_RETEST"
             breakout_triggered = True
-            send_user_alert(
-                user,
+            queue_alert(
                 f"🔄 <b>[{title}] Range Low Broken!</b>\n"
                 f"Symbol: <code>{symbol}</code>\n"
                 f"Close: <code>{last_close}</code> &lt; Low: <code>{r_low}</code>\n"
@@ -542,16 +526,16 @@ def process_user_orb(user, data, now):
         rt["last_slot_close_price"] = data["m5_close"]
         if breakout_triggered:
             rt["retest_cooldown_until"] = time.time() + 8.0
-        return True
+            persist = True
+        return persist, alerts_out
 
-    if rt.get("active_slot") != current_slot or rt.get("last_slot_close_price") != data["m5_close"]:
-        rt["active_slot"] = current_slot
-        rt["last_slot_close_price"] = data["m5_close"]
-        changed = True
+    # Keep slot close updated in RAM only (do NOT write to Redis every 3 seconds)
+    rt["active_slot"] = current_slot
+    rt["last_slot_close_price"] = data["m5_close"]
 
     # 3. Immediate Live Retest Entry Check
     if time.time() < rt.get("retest_cooldown_until", 0.0):
-        return changed
+        return persist, alerts_out
 
     state = rt["state"]
     if state == "WAIT_SELL_RETEST":
@@ -559,102 +543,125 @@ def process_user_orb(user, data, now):
         if (data["live"] is not None and data["live"] >= r_low) or wick_touch:
             rt["retest_count"] = rt.get("retest_count", 0) + 1
             cnt = rt["retest_count"]
-            send_user_alert(
-                user,
+            queue_alert(
                 f"✅ <b>[{title}] SELL Entry Triggered! ({cnt}/{max_retests})</b>\n"
                 f"Symbol: <code>{symbol}</code>\n"
                 f"Live Price: <code>{data['live']}</code> | Range Low: <code>{r_low}</code>",
                 "retest_entry"
             )
             rt["state"] = "DONE_FOR_RANGE" if cnt >= max_retests else "IN_SELL_SEEKING_HIGH_BREAK"
-            return True
+            return True, alerts_out
 
     elif state == "WAIT_BUY_RETEST":
         wick_touch = (now.second >= 10 and data["m5_low"] is not None and data["m5_low"] <= r_high)
         if (data["live"] is not None and data["live"] <= r_high) or wick_touch:
             rt["retest_count"] = rt.get("retest_count", 0) + 1
             cnt = rt["retest_count"]
-            send_user_alert(
-                user,
+            queue_alert(
                 f"✅ <b>[{title}] BUY Entry Triggered! ({cnt}/{max_retests})</b>\n"
                 f"Symbol: <code>{symbol}</code>\n"
                 f"Live Price: <code>{data['live']}</code> | Range High: <code>{r_high}</code>",
                 "retest_entry"
             )
             rt["state"] = "DONE_FOR_RANGE" if cnt >= max_retests else "IN_BUY_SEEKING_LOW_BREAK"
-            return True
+            return True, alerts_out
 
-    return changed
+    return persist, alerts_out
 
 def monitor_loop():
-    if fcntl:
-        try:
-            lock_fp = open(LOCK_FILE, "w")
-            fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except IOError:
-            return
-
+    global last_tv_poll
     print("🚀 Multi-User ORB Monitoring Engine Started.", flush=True)
-    load_all_users()  # Warm RAM cache once from Upstash Redis
+    init_storage()
     setup_bot_commands_and_webhook()
 
     while True:
         try:
-            users = load_all_users()
-            active_users = [u for u in users.values() if u.get("active", True) and u.get("ranges")]
+            with state_lock:
+                unique_symbols = sorted(list(set(
+                    u["symbol"].upper()
+                    for u in users_db.values()
+                    if u.get("active", True) and u.get("ranges")
+                )))
 
-            if not active_users:
+            if not unique_symbols:
                 time.sleep(5)
                 continue
 
-            unique_symbols = list(set(u["symbol"].upper() for u in active_users))
             batch_data = fetch_tv_batch(unique_symbols)
+            now = datetime.now(IST)
+            last_tv_poll = now.strftime("%H:%M:%S IST")
 
-            if batch_data:
-                with price_cache_lock:
+            should_persist = False
+            needs_fast_poll = False
+            alerts_to_send = []
+
+            with state_lock:
+                if batch_data:
                     latest_prices.update(batch_data)
 
-            now = datetime.now(IST)
-            any_changed = False
-            needs_fast_poll = False
+                for u in users_db.values():
+                    if not u.get("active", True) or not u.get("ranges"):
+                        continue
+                    sym = u["symbol"].upper()
+                    data = batch_data.get(sym)
+                    p_flag, u_alerts = process_user_orb_locked(u, data, now)
+                    if p_flag:
+                        should_persist = True
+                    if u_alerts:
+                        alerts_to_send.extend(u_alerts)
+                    if u["runtime"].get("state") in ("MARKING_RANGE", "WAIT_SELL_RETEST", "WAIT_BUY_RETEST"):
+                        needs_fast_poll = True
 
-            for u in active_users:
-                sym = u["symbol"].upper()
-                data = batch_data.get(sym)
-                if process_user_orb(u, data, now):
-                    any_changed = True
-                if u["runtime"].get("state") in ("MARKING_RANGE", "WAIT_SELL_RETEST", "WAIT_BUY_RETEST"):
-                    needs_fast_poll = True
+            # Send Telegram alerts & persist OUTSIDE state_lock
+            for cid, msg_text in alerts_to_send:
+                send_message(cid, msg_text)
 
-            if any_changed:
-                save_all_users(users)
+            if should_persist:
+                persist_users_async()
 
             time.sleep(3 if needs_fast_poll else 5)
         except Exception as e:
             print(f"[LOOP] Unexpected error: {e}", flush=True)
             time.sleep(5)
 
+def start_monitor_once():
+    global monitor_started
+    with state_lock:
+        if monitor_started:
+            return
+        monitor_started = True
+    threading.Thread(target=monitor_loop, daemon=True).start()
+
+# Start monitor 2s after boot so Gunicorn binds $PORT immediately
+threading.Timer(2.0, start_monitor_once).start()
+
 # ================= TELEGRAM WEBHOOK HANDLERS =================
 def handle_message(msg):
     chat_id = str(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
 
-    users = load_all_users()
-    user = get_or_create_user(users, chat_id)
+    with state_lock:
+        user = _ensure_user_locked(chat_id)
+        if text.startswith("/"):
+            user["ui_step"] = None
+            user["ui_temp"] = {}
+            user_snap = copy.deepcopy(user)
+            cmd = text.split()[0].lower()
+            step = None
+        else:
+            step = user.get("ui_step")
+            user_snap = copy.deepcopy(user)
+            cmd = None
 
-    if text.startswith("/"):
-        user["ui_step"] = None
-        user["ui_temp"] = {}
-        save_all_users(users)
-
-        cmd = text.split()[0].lower()
+    if cmd:
+        persist_users_async()
         if cmd == "/start":
-            send_message(chat_id, main_menu_text(user), main_menu_keyboard(user))
+            send_message(chat_id, main_menu_text(user_snap), main_menu_keyboard(user_snap))
         elif cmd == "/ranges":
-            t, kb = ranges_menu_view(user)
+            t, kb = ranges_menu_view(user_snap)
             send_message(chat_id, t, kb)
         elif cmd == "/status":
-            t, kb = status_view(user)
+            t, kb = status_view(user_snap)
             send_message(chat_id, t, kb)
         elif cmd == "/help":
             t, kb = help_view()
@@ -663,7 +670,6 @@ def handle_message(msg):
             send_message(chat_id, "Unknown command. Use /start to open the Main Menu.")
         return
 
-    step = user.get("ui_step")
     if step == "AWAIT_SYMBOL":
         sym = text.upper()
         if ":" not in sym:
@@ -679,22 +685,27 @@ def handle_message(msg):
                 f"❌ Symbol <code>{sym}</code> was not found on TradingView.\nPlease check spelling and try again (e.g., <code>OANDA:XAUUSD</code>, <code>BINANCE:BTCUSDT</code>)."
             )
             return
-        user["symbol"] = sym
-        user["ui_step"] = None
-        user["runtime"]["active_instance_id"] = None
-        save_all_users(users)
+        with state_lock:
+            user = _ensure_user_locked(chat_id)
+            user["symbol"] = sym
+            user["ui_step"] = None
+            user["runtime"]["active_instance_id"] = None
+            user_snap = copy.deepcopy(user)
+        persist_users_async()
         send_message(
             chat_id,
-            f"✅ Symbol updated to <code>{sym}</code> (Live: <code>{pdata['live']}</code>)!\n\n" + main_menu_text(user),
-            main_menu_keyboard(user)
+            f"✅ Symbol updated to <code>{sym}</code> (Live: <code>{pdata['live']}</code>)!\n\n" + main_menu_text(user_snap),
+            main_menu_keyboard(user_snap)
         )
         return
 
     elif step == "AWAIT_ADD_TITLE":
         title = text[:28] or "Range"
-        user["ui_temp"] = {"title": title}
-        user["ui_step"] = "AWAIT_ADD_TIME"
-        save_all_users(users)
+        with state_lock:
+            user = _ensure_user_locked(chat_id)
+            user["ui_temp"] = {"title": title}
+            user["ui_step"] = "AWAIT_ADD_TIME"
+        persist_users_async()
         send_message(
             chat_id,
             f"👍 Title set to <b>{title}</b>.\n\nNow send the <b>5-minute candle start time</b> in 24-hour IST format (<code>HH:MM</code>), e.g., <code>01:00</code>, <code>12:00</code>, or <code>15:05</code>:"
@@ -705,55 +716,71 @@ def handle_message(msg):
         if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", text):
             send_message(chat_id, "⚠️ Invalid time format. Please send in 24-hour <code>HH:MM</code> format (e.g., <code>09:15</code> or <code>15:05</code>):")
             return
-        title = user.get("ui_temp", {}).get("title", "Range")
-        user["ranges"].append({"title": title, "time": text})
-        user["ranges"].sort(key=lambda x: x["time"])
-        user["ui_step"] = None
-        user["ui_temp"] = {}
-        save_all_users(users)
-        t, kb = ranges_menu_view(user)
+        with state_lock:
+            user = _ensure_user_locked(chat_id)
+            title = user.get("ui_temp", {}).get("title", "Range")
+            user["ranges"].append({"title": title, "time": text})
+            user["ranges"].sort(key=lambda x: x["time"])
+            user["ui_step"] = None
+            user["ui_temp"] = {}
+            user_snap = copy.deepcopy(user)
+        persist_users_async()
+        t, kb = ranges_menu_view(user_snap)
         send_message(chat_id, f"✅ Range <b>{title} ({text} IST)</b> added!\n\n" + t, kb)
         return
 
     elif step == "AWAIT_EDIT_TITLE":
-        idx = user.get("ui_temp", {}).get("edit_idx")
-        if idx is None or idx >= len(user["ranges"]):
-            user["ui_step"] = None
-            save_all_users(users)
-            send_message(chat_id, "⚠️ Range not found. Returning to menu.", main_menu_keyboard(user))
-            return
-        if text != "-":
-            user["ranges"][idx]["title"] = text[:28]
-        user["ui_step"] = "AWAIT_EDIT_TIME"
-        save_all_users(users)
-        cur_time = user["ranges"][idx]["time"]
-        send_message(
-            chat_id,
-            f"Now send the new start time in 24-hr IST (<code>HH:MM</code>), or send <code>-</code> to keep <code>{cur_time}</code>:"
-        )
+        with state_lock:
+            user = _ensure_user_locked(chat_id)
+            idx = user.get("ui_temp", {}).get("edit_idx")
+            if idx is None or idx >= len(user["ranges"]):
+                user["ui_step"] = None
+                user_snap = copy.deepcopy(user)
+                found = False
+            else:
+                if text != "-":
+                    user["ranges"][idx]["title"] = text[:28]
+                user["ui_step"] = "AWAIT_EDIT_TIME"
+                cur_time = user["ranges"][idx]["time"]
+                found = True
+        persist_users_async()
+        if not found:
+            send_message(chat_id, "⚠️ Range not found. Returning to menu.", main_menu_keyboard(user_snap))
+        else:
+            send_message(
+                chat_id,
+                f"Now send the new start time in 24-hr IST (<code>HH:MM</code>), or send <code>-</code> to keep <code>{cur_time}</code>:"
+            )
         return
 
     elif step == "AWAIT_EDIT_TIME":
-        idx = user.get("ui_temp", {}).get("edit_idx")
-        if idx is None or idx >= len(user["ranges"]):
-            user["ui_step"] = None
-            save_all_users(users)
-            send_message(chat_id, "⚠️ Range not found. Returning to menu.", main_menu_keyboard(user))
+        if text != "-" and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", text):
+            send_message(chat_id, "⚠️ Invalid time format. Send <code>HH:MM</code> (e.g., <code>14:30</code>) or <code>-</code> to keep current:")
             return
-        if text != "-":
-            if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", text):
-                send_message(chat_id, "⚠️ Invalid time format. Send <code>HH:MM</code> (e.g., <code>14:30</code>) or <code>-</code> to keep current:")
-                return
-            user["ranges"][idx]["time"] = text
-        user["ranges"].sort(key=lambda x: x["time"])
-        user["ui_step"] = None
-        user["ui_temp"] = {}
-        save_all_users(users)
-        t, kb = ranges_menu_view(user)
-        send_message(chat_id, "✅ Range updated!\n\n" + t, kb)
+        with state_lock:
+            user = _ensure_user_locked(chat_id)
+            idx = user.get("ui_temp", {}).get("edit_idx")
+            if idx is None or idx >= len(user["ranges"]):
+                user["ui_step"] = None
+                user_snap = copy.deepcopy(user)
+                found = False
+            else:
+                if text != "-":
+                    user["ranges"][idx]["time"] = text
+                user["ranges"].sort(key=lambda x: x["time"])
+                user["ui_step"] = None
+                user["ui_temp"] = {}
+                user_snap = copy.deepcopy(user)
+                found = True
+        persist_users_async()
+        if not found:
+            send_message(chat_id, "⚠️ Range not found. Returning to menu.", main_menu_keyboard(user_snap))
+        else:
+            t, kb = ranges_menu_view(user_snap)
+            send_message(chat_id, "✅ Range updated!\n\n" + t, kb)
         return
 
-    send_message(chat_id, main_menu_text(user), main_menu_keyboard(user))
+    send_message(chat_id, main_menu_text(user_snap), main_menu_keyboard(user_snap))
 
 def handle_callback(cb):
     cb_id = cb["id"]
@@ -761,135 +788,141 @@ def handle_callback(cb):
     msg_id = cb["message"]["message_id"]
     data = cb.get("data", "")
 
-    users = load_all_users()
-    user = get_or_create_user(users, chat_id)
-
     if data == "noop":
         answer_callback(cb_id)
         return
 
-    if data == "menu:main":
-        user["ui_step"] = None
-        user["ui_temp"] = {}
-        save_all_users(users)
-        edit_message(chat_id, msg_id, main_menu_text(user), main_menu_keyboard(user))
-        answer_callback(cb_id)
+    should_persist = False
+    cb_toast = ""
+    out_text = None
+    out_kb = None
 
-    elif data == "menu:symbol":
-        user["ui_step"] = "AWAIT_SYMBOL"
-        save_all_users(users)
-        edit_message(
-            chat_id, msg_id,
-            f"📈 <b>Set TradingView Symbol</b>\n\n"
-            f"Current Symbol: <code>{user['symbol']}</code>\n\n"
-            f"Please reply with your TradingView ticker (with exchange prefix):\n"
-            f"• Gold: <code>OANDA:XAUUSD</code>\n"
-            f"• Silver: <code>OANDA:XAGUSD</code>\n"
-            f"• Bitcoin: <code>BINANCE:BTCUSDT</code>\n"
-            f"• EUR/USD: <code>FX:EURUSD</code>",
-            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "menu:main"}]]}
-        )
-        answer_callback(cb_id)
+    with state_lock:
+        user = _ensure_user_locked(chat_id)
 
-    elif data == "menu:ranges":
-        user["ui_step"] = None
-        save_all_users(users)
-        t, kb = ranges_menu_view(user)
-        edit_message(chat_id, msg_id, t, kb)
-        answer_callback(cb_id)
+        if data == "menu:main":
+            user["ui_step"] = None
+            user["ui_temp"] = {}
+            should_persist = True
+            user_snap = copy.deepcopy(user)
+            out_text, out_kb = main_menu_text(user_snap), main_menu_keyboard(user_snap)
 
-    elif data == "range:add":
-        user["ui_step"] = "AWAIT_ADD_TITLE"
-        user["ui_temp"] = {}
-        save_all_users(users)
-        edit_message(
-            chat_id, msg_id,
-            "➕ <b>Add New Range</b>\n\nStep 1 of 2: Send a <b>Title</b> for this range (e.g., <code>Asian Open</code>, <code>London Open</code>, <code>NY Session</code>):",
-            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "menu:ranges"}]]}
-        )
-        answer_callback(cb_id)
-
-    elif data.startswith("range:edit:"):
-        idx = int(data.split(":")[2])
-        if 0 <= idx < len(user["ranges"]):
-            r = user["ranges"][idx]
-            user["ui_step"] = "AWAIT_EDIT_TITLE"
-            user["ui_temp"] = {"edit_idx": idx}
-            save_all_users(users)
-            edit_message(
-                chat_id, msg_id,
-                f"✏️ <b>Edit Range: {r['title']} ({r['time']} IST)</b>\n\n"
-                f"Send a new <b>Title</b>, or send <code>-</code> to keep <b>{r['title']}</b>:",
-                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "menu:ranges"}]]}
+        elif data == "menu:symbol":
+            user["ui_step"] = "AWAIT_SYMBOL"
+            should_persist = True
+            sym = user["symbol"]
+            out_text = (
+                f"📈 <b>Set TradingView Symbol</b>\n\n"
+                f"Current Symbol: <code>{sym}</code>\n\n"
+                f"Please reply with your TradingView ticker (with exchange prefix):\n"
+                f"• Gold: <code>OANDA:XAUUSD</code>\n"
+                f"• Silver: <code>OANDA:XAGUSD</code>\n"
+                f"• Bitcoin: <code>BINANCE:BTCUSDT</code>\n"
+                f"• EUR/USD: <code>FX:EURUSD</code>"
             )
-            answer_callback(cb_id)
-        else:
-            answer_callback(cb_id, "Range not found.")
+            out_kb = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "menu:main"}]]}
 
-    elif data.startswith("range:del:"):
-        idx = int(data.split(":")[2])
-        if 0 <= idx < len(user["ranges"]):
-            removed = user["ranges"].pop(idx)
-            save_all_users(users)
-            t, kb = ranges_menu_view(user)
-            edit_message(chat_id, msg_id, t, kb)
-            answer_callback(cb_id, f"Deleted {removed['title']} ({removed['time']})")
-        else:
-            answer_callback(cb_id, "Range not found.")
+        elif data == "menu:ranges":
+            user["ui_step"] = None
+            should_persist = True
+            user_snap = copy.deepcopy(user)
+            out_text, out_kb = ranges_menu_view(user_snap)
 
-    elif data == "menu:alerts":
-        t, kb = alerts_menu_view(user)
-        edit_message(chat_id, msg_id, t, kb)
-        answer_callback(cb_id)
+        elif data == "range:add":
+            user["ui_step"] = "AWAIT_ADD_TITLE"
+            user["ui_temp"] = {}
+            should_persist = True
+            out_text = "➕ <b>Add New Range</b>\n\nStep 1 of 2: Send a <b>Title</b> for this range (e.g., <code>Asian Open</code>, <code>London Open</code>, <code>NY Session</code>):"
+            out_kb = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "menu:ranges"}]]}
 
-    elif data.startswith("alert:toggle:"):
-        key = data.split(":")[2]
-        if key in ("range_marked", "breakout_close", "retest_entry"):
-            cur = user["alerts"].get(key, True)
-            user["alerts"][key] = not cur
-            save_all_users(users)
-            t, kb = alerts_menu_view(user)
-            edit_message(chat_id, msg_id, t, kb)
-            answer_callback(cb_id, "Updated!")
+        elif data.startswith("range:edit:"):
+            idx = int(data.split(":")[2])
+            if 0 <= idx < len(user["ranges"]):
+                r = user["ranges"][idx]
+                user["ui_step"] = "AWAIT_EDIT_TITLE"
+                user["ui_temp"] = {"edit_idx": idx}
+                should_persist = True
+                out_text = (
+                    f"✏️ <b>Edit Range: {r['title']} ({r['time']} IST)</b>\n\n"
+                    f"Send a new <b>Title</b>, or send <code>-</code> to keep <b>{r['title']}</b>:"
+                )
+                out_kb = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "menu:ranges"}]]}
+            else:
+                cb_toast = "Range not found."
 
-    elif data in ("retest:inc", "retest:dec"):
-        mx = int(user.get("max_retests", 4))
-        mx = min(20, mx + 1) if data == "retest:inc" else max(1, mx - 1)
-        user["max_retests"] = mx
-        save_all_users(users)
-        t, kb = alerts_menu_view(user)
-        edit_message(chat_id, msg_id, t, kb)
-        answer_callback(cb_id, f"Max Retests: {mx}")
+        elif data.startswith("range:del:"):
+            idx = int(data.split(":")[2])
+            if 0 <= idx < len(user["ranges"]):
+                removed = user["ranges"].pop(idx)
+                should_persist = True
+                user_snap = copy.deepcopy(user)
+                out_text, out_kb = ranges_menu_view(user_snap)
+                cb_toast = f"Deleted {removed['title']} ({removed['time']})"
+            else:
+                cb_toast = "Range not found."
 
-    elif data == "menu:status":
-        t, kb = status_view(user)
-        edit_message(chat_id, msg_id, t, kb)
-        answer_callback(cb_id, "Status refreshed")
+        elif data == "menu:alerts":
+            user_snap = copy.deepcopy(user)
+            out_text, out_kb = alerts_menu_view(user_snap)
 
-    elif data == "action:toggle_active":
-        user["active"] = not user.get("active", True)
-        save_all_users(users)
-        edit_message(chat_id, msg_id, main_menu_text(user), main_menu_keyboard(user))
-        answer_callback(cb_id, "Alerts Resumed" if user["active"] else "Alerts Paused")
+        elif data.startswith("alert:toggle:"):
+            key = data.split(":")[2]
+            if key in ("range_marked", "breakout_close", "retest_entry"):
+                user["alerts"][key] = not user["alerts"].get(key, True)
+                should_persist = True
+                user_snap = copy.deepcopy(user)
+                out_text, out_kb = alerts_menu_view(user_snap)
+                cb_toast = "Updated!"
 
-    elif data == "menu:help":
-        t, kb = help_view()
-        edit_message(chat_id, msg_id, t, kb)
-        answer_callback(cb_id)
+        elif data in ("retest:inc", "retest:dec"):
+            mx = int(user.get("max_retests", 4))
+            mx = min(20, mx + 1) if data == "retest:inc" else max(1, mx - 1)
+            user["max_retests"] = mx
+            should_persist = True
+            user_snap = copy.deepcopy(user)
+            out_text, out_kb = alerts_menu_view(user_snap)
+            cb_toast = f"Max Retests: {mx}"
+
+        elif data == "menu:status":
+            user_snap = copy.deepcopy(user)
+            cb_toast = "Status refreshed"
+
+        elif data == "action:toggle_active":
+            user["active"] = not user.get("active", True)
+            should_persist = True
+            user_snap = copy.deepcopy(user)
+            out_text, out_kb = main_menu_text(user_snap), main_menu_keyboard(user_snap)
+            cb_toast = "Alerts Resumed" if user["active"] else "Alerts Paused"
+
+        elif data == "menu:help":
+            out_text, out_kb = help_view()
+
+    if data == "menu:status":
+        out_text, out_kb = status_view(user_snap)
+
+    if should_persist:
+        persist_users_async()
+    if out_text is not None:
+        edit_message(chat_id, msg_id, out_text, out_kb)
+    answer_callback(cb_id, cb_toast)
 
 # ================= FLASK ROUTES =================
 @app.route("/")
 def home():
-    users = load_all_users()
-    active_cnt = sum(1 for u in users.values() if u.get("active", True))
-    unique_syms = len(set(u["symbol"].upper() for u in users.values() if u.get("active", True)))
+    start_monitor_once()
+    with state_lock:
+        total_u = len(users_db)
+        active_u = sum(1 for u in users_db.values() if u.get("active", True))
+        unique_s = len(set(u["symbol"].upper() for u in users_db.values() if u.get("active", True)))
     return jsonify({
         "service": "ORB Multi-User Telegram Bot",
         "status": "running",
         "redis_status": redis_status,
-        "total_users": len(users),
-        "active_users": active_cnt,
-        "tracked_unique_symbols": unique_syms,
+        "db_loaded": db_loaded,
+        "total_users": total_u,
+        "active_users": active_u,
+        "tracked_unique_symbols": unique_s,
+        "last_tv_poll": last_tv_poll,
         "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     })
 
@@ -903,14 +936,22 @@ def manual_set_webhook():
         return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}), 400
     base_url = RENDER_EXTERNAL_URL or request.url_root.rstrip("/").replace("http://", "https://")
     webhook_url = f"{base_url}/webhook"
-    res = tg_api("setWebhook", {"url": webhook_url})
-    setup_bot_commands_and_webhook()
+    res = tg_api("setWebhook", {"url": webhook_url, "drop_pending_updates": False})
+    commands = [
+        {"command": "start", "description": "Open Main Menu & Welcome"},
+        {"command": "ranges", "description": "Add, Edit, or Delete Range Timings"},
+        {"command": "status", "description": "View Live Price & Active Range Status"},
+        {"command": "help", "description": "How to use this ORB Trading Bot"}
+    ]
+    tg_api("setMyCommands", {"commands": commands})
     return jsonify({"webhook_url": webhook_url, "telegram_response": res})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    start_monitor_once()
     update = request.get_json(silent=True) or {}
-    def process_update(upd):
+
+    def _process(upd):
         try:
             if "message" in upd and "text" in upd["message"]:
                 handle_message(upd["message"])
@@ -919,12 +960,8 @@ def webhook():
         except Exception as e:
             print(f"[WEBHOOK] Error: {e}", flush=True)
 
-    threading.Thread(target=process_update, args=(update,), daemon=True).start()
+    webhook_executor.submit(_process, update)
     return "OK", 200
-
-# Start background monitoring thread
-bg_thread = threading.Thread(target=monitor_loop, daemon=True)
-bg_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
