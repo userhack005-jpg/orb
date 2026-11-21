@@ -214,43 +214,88 @@ TV_HEADERS = {
     "Content-Type": "application/json"
 }
 
-def fetch_tv_batch(symbols):
-    unique_syms = sorted(list(set(s.strip().upper() for s in symbols if s and s.strip())))
-    if not unique_syms:
-        return {}
-    url = "https://scanner.tradingview.com/global/scan"
+def _tv_scan_endpoint(endpoint, tickers):
+    url = f"https://scanner.tradingview.com/{endpoint}/scan"
     payload = {
-        "symbols": {"tickers": unique_syms},
+        "symbols": {"tickers": tickers},
         "columns": ["close", "bid", "ask", "open|5", "high|5", "low|5", "close|5"]
     }
-    try:
-        resp = requests.post(url, json=payload, headers=TV_HEADERS, timeout=8)
-        if resp.status_code != 200 or not resp.text.strip():
-            print(f"[TV] HTTP {resp.status_code} (rate limit/empty)", flush=True)
-            return {}
-        data = resp.json().get("data", [])
-        out = {}
-        for item in data:
-            sym = item.get("s", "").upper()
-            d = item.get("d", [])
-            if len(d) >= 7:
-                live_tick = d[1] if d[1] is not None else d[0]
-                out[sym] = {
-                    "live": live_tick,
-                    "m5_open": d[3],
-                    "m5_high": d[4],
-                    "m5_low": d[5],
-                    "m5_close": d[6]
-                }
-        return out
-    except Exception as e:
-        print(f"[TV] Batch fetch error: {e}", flush=True)
+    resp = requests.post(url, json=payload, headers=TV_HEADERS, timeout=8)
+    if resp.status_code != 200 or not resp.text.strip():
+        return {}, resp.status_code
+    data = resp.json().get("data", [])
+    out = {}
+    for item in data:
+        sym = item.get("s", "").upper()
+        d = item.get("d", [])
+        if len(d) >= 7:
+            live_tick = d[1] if d[1] is not None else d[0]
+            out[sym] = {
+                "live": live_tick,
+                "m5_open": d[3],
+                "m5_high": d[4],
+                "m5_low": d[5],
+                "m5_close": d[6]
+            }
+    return out, 200
+
+def fetch_tv_batch(symbols):
+    unique_syms = sorted(list(set(
+        s.strip().upper().replace(" ", "").replace("/", "")
+        for s in symbols if s and s.strip()
+    )))
+    if not unique_syms:
         return {}
 
+    out = {}
+    remaining = list(unique_syms)
+
+    # 1. Try global, then cfd, forex, crypto for any missing symbols
+    for ep in ("global", "cfd", "forex", "crypto"):
+        if not remaining:
+            break
+        try:
+            res, status = _tv_scan_endpoint(ep, remaining)
+            if status != 200:
+                print(f"[TV] {ep}/scan HTTP {status}", flush=True)
+                continue
+            out.update(res)
+            remaining = [s for s in remaining if s not in out]
+        except Exception as e:
+            print(f"[TV] {ep}/scan error: {e}", flush=True)
+
+    # 2. Direct /symbol fallback for any ticker still missing (works for metals/CFDs/stocks)
+    for sym in remaining:
+        try:
+            r = requests.get(
+                "https://scanner.tradingview.com/symbol",
+                params={
+                    "symbol": sym,
+                    "fields": "close,bid,ask,open|5,high|5,low|5,close|5"
+                },
+                headers=TV_HEADERS,
+                timeout=8
+            )
+            if r.status_code == 200 and r.text.strip():
+                j = r.json()
+                if j.get("close") is not None or j.get("bid") is not None:
+                    out[sym] = {
+                        "live": j.get("bid") if j.get("bid") is not None else j.get("close"),
+                        "m5_open": j.get("open|5"),
+                        "m5_high": j.get("high|5"),
+                        "m5_low": j.get("low|5"),
+                        "m5_close": j.get("close|5")
+                    }
+        except Exception as e:
+            print(f"[TV] /symbol fallback error ({sym}): {e}", flush=True)
+
+    return out
+
 def validate_tv_symbol(symbol):
-    sym = symbol.strip().upper()
+    sym = symbol.strip().upper().replace(" ", "").replace("/", "")
     res = fetch_tv_batch([sym])
     return sym in res, res.get(sym)
+
 
 # ================= INLINE KEYBOARD BUILDERS =================
 def main_menu_keyboard(user):
@@ -671,8 +716,7 @@ def handle_message(msg):
         return
 
     if step == "AWAIT_SYMBOL":
-        sym = text.upper()
-        if ":" not in sym:
+        sym = text.upper().replace(" ", "").replace("/", "")        if ":" not in sym:
             send_message(
                 chat_id,
                 "⚠️ Please include the exchange prefix (e.g., <code>OANDA:XAUUSD</code> or <code>BINANCE:BTCUSDT</code>).\nTry again or send /start to cancel."
