@@ -716,7 +716,8 @@ def handle_message(msg):
         return
 
     if step == "AWAIT_SYMBOL":
-        sym = text.upper().replace(" ", "").replace("/", "")        if ":" not in sym:
+        sym = text.upper().replace(" ", "").replace("/", "")     
+        if ":" not in sym:
             send_message(
                 chat_id,
                 "⚠️ Please include the exchange prefix (e.g., <code>OANDA:XAUUSD</code> or <code>BINANCE:BTCUSDT</code>).\nTry again or send /start to cancel."
