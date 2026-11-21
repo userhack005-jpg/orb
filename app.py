@@ -903,13 +903,16 @@ def manual_set_webhook():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(silent=True) or {}
-    try:
-        if "message" in update and "text" in update["message"]:
-            handle_message(update["message"])
-        elif "callback_query" in update:
-            handle_callback(update["callback_query"])
-    except Exception as e:
-        print(f"[WEBHOOK] Error: {e}", flush=True)
+    def process_update(upd):
+        try:
+            if "message" in upd and "text" in upd["message"]:
+                handle_message(upd["message"])
+            elif "callback_query" in upd:
+                handle_callback(upd["callback_query"])
+        except Exception as e:
+            print(f"[WEBHOOK] Error: {e}", flush=True)
+
+    threading.Thread(target=process_update, args=(update,), daemon=True).start()
     return "OK", 200
 
 # Start background monitoring thread
