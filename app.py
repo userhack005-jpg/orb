@@ -190,17 +190,18 @@ def run_bot():
         bot_status["retest_count"] = retest_count
         bot_status["last_updated"] = now.strftime("%H:%M:%S IST")
 
+        data = get_tv_data(symbol)
+        if data:
+            bot_status["live_price"] = data["live"]
+
         if state in ("DONE_FOR_RANGE", "MISSED_WINDOW_WAITING_NEXT"):
             time.sleep(4)
             continue
 
-        data = get_tv_data(symbol)
         if not data:
             time.sleep(3)
             continue
-
-        bot_status["live_price"] = data["live"]
-
+            
         # 1. Marking the 5-minute range
         if state == "MARKING_RANGE":
             if now < target_end:
