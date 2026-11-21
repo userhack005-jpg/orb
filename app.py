@@ -3,10 +3,10 @@ import json
 import time
 import threading
 import requests
-from datetime import datetime, timedelta
 import pytz
 from flask import Flask, request, jsonify, render_template_string
-
+from datetime import datetime, timedelta, timezone
+IST = timezone(timedelta(hours=5, minutes=30))
 app = Flask(__name__)
 
 CONFIG_FILE = "config.json"
@@ -26,12 +26,12 @@ bot_status = {
 }
 
 def add_log(msg):
-    tz = pytz.timezone(load_config().get("timezone", "Asia/Kolkata"))
-    ts = datetime.now(tz).strftime("%H:%M:%S")
+    ts = datetime.now(IST).strftime("%H:%M:%S")
     entry = f"[{ts}] {msg}"
     print(entry, flush=True)
     bot_status["logs"].insert(0, entry)
     bot_status["logs"] = bot_status["logs"][:30]
+
 
 def load_config():
     with config_lock:
@@ -123,7 +123,7 @@ def get_current_schedule(now, ranges):
         base_date = (now + timedelta(days=day_offset)).date()
         for r in sorted_ranges:
             hh, mm = map(int, r["time"].split(":"))
-            start_dt = now.tzinfo.localize(datetime(base_date.year, base_date.month, base_date.day, hh, mm, 0))
+            start_dt = datetime(base_date.year, base_date.month, base_date.day, hh, mm, 0, tzinfo=IST)
             if start_dt <= now:
                 candidates.append((start_dt, r["title"], r["time"]))
 
@@ -151,8 +151,7 @@ def run_bot():
 
     while True:
         cfg = load_config()
-        tz = pytz.timezone(cfg.get("timezone", "Asia/Kolkata"))
-        now = datetime.now(tz)
+        now = datetime.now(IST)
         symbol = cfg.get("symbol", "OANDA:XAUUSD")
         max_retests = int(cfg.get("max_retests", 4))
         ranges = cfg.get("ranges", [])
